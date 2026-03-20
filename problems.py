@@ -412,6 +412,14 @@ class SNESProblemNest(ProblemNest):
 class TSProblemNest(SNESProblemNest):
     """A problem class for solving time-dependent nonlinear problems with TS assuming nested matrices and vectors."""
 
+    @property
+    def allowed_input_parameters(self):
+        return super().allowed_input_parameters + ('output_period_timesteps', )
+    
+    def update(self, **kwargs):
+        self.output_period_timesteps = 1
+        super().update(**kwargs)
+
     def reset(self):
         super().reset()
         for attr in [
@@ -504,9 +512,11 @@ class TSProblemNest(SNESProblemNest):
 
     def tsPostStep(self, ts):
         t = ts.getTime()
-        x = ts.getSolution()
-        self.Vec2Function(x, self.u_i)
-        self.output(t=t)
+        ti = ts.getStepNumber()
+        if ti%self.output_period_timesteps == 0:
+            x = ts.getSolution()
+            self.Vec2Function(x, self.u_i)
+            self.output(t=t)
 
     @property
     def ts(self):
