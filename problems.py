@@ -112,6 +112,11 @@ class Problem:
             self._bcs = [[]]
         return self._bcs
     
+    def apply_bcs(self):
+        for u, bcs in zip(self.u_i, self.bcs):
+            for bc in bcs:
+                bc.set(u.x.array)
+    
     @property
     def ns(self):
         if not hasattr(self, '_ns'):
@@ -277,10 +282,11 @@ class ProblemNest(Problem):
         return self._x
     
     def Vec2Function(self, x, u_i):
-        for i, (x_sub, u) in enumerate(zip(x.getNestSubVecs(), u_i)):
-            if hasattr(u, 'x'):
-                x_sub.copy(u.x.petsc_vec)
-                u.x.petsc_vec.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
+        xs = x.getNestSubVecs()
+        for i, x_sub in enumerate(xs):
+            if hasattr(u_i[i], 'x'):
+                x_sub.copy(u_i[i].x.petsc_vec)
+                u_i[i].x.petsc_vec.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
             else:
                 u_i[i][0] = x_sub.getValue(0) # assume scalar
         
@@ -397,9 +403,7 @@ class SNESProblemNest(ProblemNest):
         opts = PETSc.Options()
         for k,v in petsc_options.items(): opts[k] = v
 
-        for u, bcs in zip(self.u_i, self.bcs):
-            for bc in bcs:
-                bc.set(u.x.array)
+        self.apply_bcs()
 
         if monitor: self.snes.setMonitor(self.snesMonitor)
 
@@ -411,13 +415,15 @@ class SNESProblemNest(ProblemNest):
 
 class TSProblemNest(SNESProblemNest):
     """A problem class for solving time-dependent nonlinear problems with TS assuming nested matrices and vectors."""
-
+    
     @property
     def allowed_input_parameters(self):
-        return super().allowed_input_parameters + ('output_period_timesteps', )
+        return super().allowed_input_parameters + ('vis_output_period_timesteps', 'vis_output_period')
     
     def update(self, **kwargs):
-        self.output_period_timesteps = 1
+        self.vis_output_period_timesteps = 1
+        self.vis_output_period = None
+        self.last_vis_output_time = 0.0
         super().update(**kwargs)
 
     def reset(self):
@@ -510,13 +516,30 @@ class TSProblemNest(SNESProblemNest):
             self._snes_vtxs = self.create_vtxs(u_vis=self.snes_u_vis, 
                                                suffix='_ts_{:d}_{:d}_snes'.format(ti, self.ts_step_stage_i))
 
+    def perform_action(self, period, last, period_dt, default=False):
+        """Helper function to determine whether to perform an action based on a time or timestep period."""
+        perform = default
+        if period is not None:
+            t = self.ts.getTime()
+            perform = t-last >= period
+        else:
+            ti = self.ts.getStepNumber()
+            perform = ti%period_dt == 0
+        return perform
+
     def tsPostStep(self, ts):
-        t = ts.getTime()
-        ti = ts.getStepNumber()
-        if ti%self.output_period_timesteps == 0:
+        if self.perform_action(self.vis_output_period, 
+                               self.last_vis_output_time, 
+                               self.vis_output_period_timesteps):
             x = ts.getSolution()
-            self.Vec2Function(x, self.u_i)
-            self.output(t=t)
+            # it appears to be necessary to copy the output 
+            # of getSolution in order to avoid some strange 
+            # TS resetting when using nested vectors
+            # (found by trial and error, no explanation yet)
+            self.Vec2Function(x.copy(), self.u_i)
+            self.output(t=ts.getTime())
+            if self.vis_output_period is not None:
+                self.last_vis_output_time += self.vis_output_period
 
     @property
     def ts(self):
@@ -559,18 +582,23 @@ class TSProblemNest(SNESProblemNest):
             self._ts.destroy()
             delattr(self, '_ts')
     
-    def solve(self, petsc_options={}, snes_monitor : bool=False):
+    def solve(self, petsc_options={}, snes_monitor : bool=False,
+              vis_output_period_timesteps : int=None, 
+              vis_output_period : float=None):
         self.reset_ts()
         self.snes_monitor = snes_monitor
+
+        # only set these options if they've been set by the user to avoid overwriting any options that may have been set as attributes
+        if vis_output_period_timesteps is not None: self.vis_output_period_timesteps = vis_output_period_timesteps
+        if vis_output_period is not None: self.vis_output_period = vis_output_period
 
         opts = PETSc.Options()
         for k,v in petsc_options.items(): opts[k] = v
 
-        for u, bcs in zip(self.u_i, self.bcs):
-            for bc in bcs:
-                bc.set(u.x.array)
+        self.apply_bcs()
         
         if self.snes_monitor: self.snes.setMonitor(self.snesMonitor)
 
         self.output(t=0.0)
+        self.last_vis_output_time = 0.0
         self.ts.solve(self.x)
